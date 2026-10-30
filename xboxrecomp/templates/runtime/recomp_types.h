@@ -546,6 +546,70 @@ static inline int32_t recomp_cvt_si(double x, int round_nearest)
 #define MMIO_WR32(addr, v) do { uint32_t _ma = (uint32_t)(addr); uint32_t _mv = (uint32_t)(v); \
     if (XBOX_IS_MMIO(_ma)) xbox_mmio_write(_ma, _mv, 4); else MEM32(XBOX_DEV_FOLD(_ma)) = _mv; } while (0)
 
+/* ---------------------------------------------------------------
+ * NV2A PMC_INTR_0 write tracing (enabled with RECOMP_NV2A_TRACE=1)
+ *
+ * Traces writes that overlap guest address 0xFD000100 (PMC_INTR_0),
+ * especially those that can affect bit 24 (PCRTC). Instrumentation is
+ * added manually at candidate write sites; the macros themselves are
+ * left unchanged because they are used as C lvalues.
+ *
+ * Events are stored in a bounded ring buffer; when full, dropped events
+ * are counted without blocking. Tracing is disabled by default.
+ * --------------------------------------------------------------- */
+#ifdef RECOMP_NV2A_TRACE
+
+# include <stdint.h>
+# include <stddef.h>
+
+# if defined(_WIN32)
+#  include <windows.h>
+#  define NV2A_TRACE_TID() ((uintptr_t)GetCurrentThreadId())
+# else
+#  include <pthread.h>
+#  define NV2A_TRACE_TID() ((uintptr_t)pthread_self())
+# endif
+
+# define NV2A_TRACE_MAX_EVENTS 4096
+# define NV2A_TRACE_TARGET_START 0xFD000100u
+# define NV2A_TRACE_TARGET_END   0xFD000104u
+# define NV2A_TRACE_BIT24_BYTE   0xFD000103u
+
+typedef struct {
+    uint64_t seq;               /* atomic sequence number */
+    uint64_t ts_ns;             /* monotonic timestamp */
+    uintptr_t tid;              /* thread id */
+    uint32_t guest_dest;        /* guest VA of write destination */
+    uintptr_t host_dest;        /* host VA of write destination */
+    uint32_t write_size;        /* 1, 2, 4, or 8 bytes */
+    uint32_t value_before;      /* full 32-bit PMC_INTR_0 before write */
+    uint32_t value_written;     /* value being written (partial for 8/16-bit) */
+    uint32_t value_after;       /* full 32-bit PMC_INTR_0 after write */
+    uint32_t bit24_before;      /* 1 if bit 24 set before */
+    uint32_t bit24_after;       /* 1 if bit 24 set after */
+    uint32_t guest_func_va;     /* guest function VA, 0 if unknown */
+    uint32_t guest_site_va;     /* guest write-site VA, 0 if unknown */
+} nv2a_trace_event_t;
+
+extern nv2a_trace_event_t nv2a_trace_events[NV2A_TRACE_MAX_EVENTS];
+extern volatile uint64_t nv2a_trace_seq;
+extern volatile uint64_t nv2a_trace_dropped;
+
+/* Call before each traced write. Safe to call with tracing disabled. */
+void nv2a_trace_write(uint32_t guest_dest, uint32_t write_size,
+                      uint32_t value_written, uint32_t guest_func_va,
+                      uint32_t guest_site_va);
+
+# define NV2A_TRACE_WRITE(guest_dest, size, val, func_va, site_va) \
+    do { if (0) {} else nv2a_trace_write((guest_dest), (size), (val), (func_va), (site_va)); } while (0)
+
+#else /* !RECOMP_NV2A_TRACE */
+
+# define NV2A_TRACE_WRITE(guest_dest, size, val, func_va, site_va) \
+    do { } while (0)
+
+#endif /* RECOMP_NV2A_TRACE */
+
 /* ================================================================
  * SSE / XMM register state
  *

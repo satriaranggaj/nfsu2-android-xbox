@@ -1095,6 +1095,11 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
         if (vblank && NV2A_ACK[i].offset == 0x600100)
             mask &= ~0x00000001u;
         if (*r & mask) {
+# ifdef RECOMP_NV2A_TRACE
+            if (NV2A_ACK[i].offset == 0x000100) {
+                nv2a_trace_write(0xFD000100u, 4u, *r & ~mask, 0u, 0u);
+            }
+# endif
             *r &= ~mask;
         }
     }
@@ -3886,3 +3891,64 @@ HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
 }
+
+/* ---------------------------------------------------------------
+ * NV2A PMC_INTR_0 write tracing implementation
+ *
+ * Enabled when RECOMP_NV2A_TRACE is defined at compile time.
+ * Events are stored in a bounded ring buffer; when full, dropped
+ * events are counted without blocking. Tracing is disabled by
+ * default (no RECOMP_NV2A_TRACE => all NV2A_TRACE_* macros expand
+ * to nothing, no buffer allocated).
+ * --------------------------------------------------------------- */
+#ifdef RECOMP_NV2A_TRACE
+
+# include <time.h>
+
+static nv2a_trace_event_t nv2a_trace_events[NV2A_TRACE_MAX_EVENTS];
+static volatile uint64_t nv2a_trace_seq = 0;
+static volatile uint64_t nv2a_trace_dropped = 0;
+
+static uint64_t nv2a_trace_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return 0;
+}
+
+void nv2a_trace_write(uint32_t guest_dest, uint32_t write_size,
+                      uint32_t value_written, uint32_t guest_func_va,
+                      uint32_t guest_site_va)
+{
+    uint64_t seq = __atomic_add_fetch(&nv2a_trace_seq, 1, __ATOMIC_RELAXED);
+    uint64_t idx = (seq - 1) % (uint64_t)NV2A_TRACE_MAX_EVENTS;
+    nv2a_trace_event_t *ev;
+    uintptr_t host_addr = (uintptr_t)guest_dest + (uintptr_t)g_xbox_mem_offset;
+    uint32_t before = MEM32(NV2A_TRACE_TARGET_START);
+    uint32_t bit24_before = (before & 0x01000000u) ? 1 : 0;
+
+    /* Ring buffer full: count dropped events without blocking. */
+    if (seq > (uint64_t)NV2A_TRACE_MAX_EVENTS) {
+        __atomic_store_n(&nv2a_trace_dropped,
+                         seq - (uint64_t)NV2A_TRACE_MAX_EVENTS,
+                         __ATOMIC_RELAXED);
+    }
+
+    ev = &nv2a_trace_events[idx];
+    ev->seq = seq;
+    ev->ts_ns = nv2a_trace_now_ns();
+    ev->tid = NV2A_TRACE_TID();
+    ev->guest_dest = guest_dest;
+    ev->host_dest = host_addr;
+    ev->write_size = write_size;
+    ev->value_before = before;
+    ev->value_written = value_written;
+    ev->value_after = 0xFFFFFFFFu;   /* unknown without post-write read */
+    ev->bit24_before = bit24_before;
+    ev->bit24_after = 0xFFFFFFFFu;   /* unknown without post-write read */
+    ev->guest_func_va = guest_func_va;
+    ev->guest_site_va = guest_site_va;
+}
+
+#endif /* RECOMP_NV2A_TRACE */

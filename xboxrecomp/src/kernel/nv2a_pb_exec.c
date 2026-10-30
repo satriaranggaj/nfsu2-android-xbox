@@ -42,6 +42,17 @@ extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
+# ifdef RECOMP_NV2A_TRACE
+void nv2a_trace_write(uint32_t guest_dest, uint32_t write_size,
+                      uint32_t value_written, uint32_t guest_func_va,
+                      uint32_t guest_site_va);
+# define NV2A_TRACE_WRITE_PB(guest_dest, size, val, func_va, site_va) \
+    nv2a_trace_write((guest_dest), (size), (val), (func_va), (site_va))
+# else
+# define NV2A_TRACE_WRITE_PB(guest_dest, size, val, func_va, site_va) \
+    do { } while (0)
+# endif
+
 /* Debug switches, read once. getenv() walks the whole environment, and these
  * were tested per method and per batch -- millions of times a second during a
  * level load, enough to stall the thread that also acknowledges the GPU. */
@@ -3969,6 +3980,7 @@ void nv2a_pb_trap_taken(void)
         ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u);
     nv[0x400108 / 4] = 0;              /* NSOURCE */
     nv[0x400100 / 4] &= ~1u;           /* PGRAPH_INTR */
+    NV2A_TRACE_WRITE_PB(0xFD000100u, 4u, nv[0x000100 / 4] & ~0x1000u, 0u, 0u);
     nv[0x000100 / 4] &= ~0x1000u;      /* PMC_INTR_0: PGRAPH */
     InterlockedExchange(&s_trap_taken, 1);
     SetEvent(driver_event());
@@ -3990,6 +4002,7 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
     nv[0x400708 / 4] = param;                      /* TRAPPED_DATA */
     nv[0x400108 / 4] = 1;                          /* NSOURCE */
     nv[0x400100 / 4] |= 1;                         /* PGRAPH_INTR */
+    NV2A_TRACE_WRITE_PB(0xFD000100u, 4u, nv[0x000100 / 4] | 0x1000u, 0u, 0u);
     nv[0x000100 / 4] |= 0x1000;                    /* PMC_INTR_0: PGRAPH */
     InterlockedExchange(&s_trap_lock, 0);
     xbox_set_irq_line(3, 1);
@@ -4116,7 +4129,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         nv[0x400708 / 4] = param;                      /* TRAPPED_DATA */
         nv[0x400108 / 4] = 1;                          /* NSOURCE */
         nv[0x400720 / 4] = 2;                          /* FIFO: sentinel */
-        nv[0x400100 / 4] |= 1;                         /* PGRAPH_INTR */
+        nv[0x400108 / 4] = 1;                          /* PGRAPH_INTR */
+        NV2A_TRACE_WRITE_PB(0xFD000100u, 4u, nv[0x000100 / 4] | 0x1000u, 0u, 0u);
         nv[0x000100 / 4] |= 0x1000;                    /* PMC_INTR_0: PGRAPH */
         xbox_set_irq_line(3, 1);
         /* Entered: the handler writes 0 over the sentinel first thing, then
