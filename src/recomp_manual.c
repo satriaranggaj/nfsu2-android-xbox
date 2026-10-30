@@ -55,6 +55,7 @@ typedef void (*recomp_func_t)(void);
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
 extern ptrdiff_t g_xbox_mem_offset;
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx;
 
 /* ── CRT memmove/memcpy ───────────────────────────────────────
  *
@@ -99,9 +100,6 @@ void sub_002A7EE0(void) { crt_memmove(); }
  * everything in registers. The arithmetic is the lifted code's -- doubles,
  * in the same order -- so results match it exactly; RECOMP_NATIVE_CHECK=1
  * runs both and reports any difference. RECOMP_NATIVE=0 turns it off. */
-extern void sub_0009A330_gen(void);
-extern void sub_0009A250_gen(void);
-
 /* sub_0009A250: cdecl (matrix, float min[3], float max[3]) -- the box's
  * corners transformed by a 4x4 row-major matrix, as a box again (Arvo): both
  * start at the translation row, and for each row i and column j the larger
@@ -170,32 +168,13 @@ static uint32_t frustum_box_native(uint32_t self, uint32_t pmin, uint32_t pmax,
 
 void sub_0009A330(void)
 {
-    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
     static unsigned long calls, with_matrix, mismatches;
     uint32_t self = ecx, pmin = MEM32(esp + 4), pmax = MEM32(esp + 8);
     uint32_t matrix = MEM32(esp + 12), r, rc, rd;
 
-    if (mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
-        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
-    }
     calls++;
     with_matrix += matrix != 0;
-    if (mode == 0) {
-        sub_0009A330_gen();
-        return;
-    }
     r = frustum_box_native(self, pmin, pmax, matrix, &rc, &rd);
-    if (mode == 2) {
-        sub_0009A330_gen();             /* pops its own arguments */
-        if (eax != r && mismatches++ < 20)
-            fprintf(stderr, "[native] sub_0009A330 mismatch: lifted %u native %u "
-                    "(box %08X-%08X this %08X)\n", eax, r, pmin, pmax, self);
-        if ((calls & 0xFFFFF) == 0)
-            fprintf(stderr, "[native] sub_0009A330: %lu calls, %lu with a matrix, "
-                    "%lu mismatches\n", calls, with_matrix, mismatches);
-        return;
-    }
     eax = r;
     ecx = rc;
     edx = rd;
@@ -206,41 +185,15 @@ void sub_0009A330(void)
  * memory. Returns max (eax), as the original leaves it; cdecl. */
 void sub_0009A250(void)
 {
-    static int mode = -1;
     uint32_t m = MEM32(esp + 4), pmin = MEM32(esp + 8), pmax = MEM32(esp + 12);
     float mn[3], mx[3];
     int j;
 
-    if (mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
-        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
-    }
-    if (!mode) {
-        sub_0009A250_gen();
-        return;
-    }
     for (j = 0; j < 3; j++) {
         mn[j] = MEMF(pmin + 4u * j);
         mx[j] = MEMF(pmax + 4u * j);
     }
     box_transform(m, mn, mx);
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        sub_0009A250_gen();             /* writes the guest's boxes itself */
-        calls++;
-        for (j = 0; j < 3; j++)
-            if (memcmp(&mn[j], (const void *)XBOX_PTR(pmin + 4u * j), 4)
-                || memcmp(&mx[j], (const void *)XBOX_PTR(pmax + 4u * j), 4)) {
-                if (bad++ < 20)
-                    fprintf(stderr, "[native] sub_0009A250 mismatch at %u: native %g %g,"
-                            " lifted %g %g\n", j, mn[j], mx[j],
-                            MEMF(pmin + 4u * j), MEMF(pmax + 4u * j));
-                break;
-            }
-        if ((calls & 0xFFFFF) == 0)
-            fprintf(stderr, "[native] sub_0009A250: %lu calls, %lu mismatches\n", calls, bad);
-        return;
-    }
     for (j = 0; j < 3; j++) {
         MEMF(pmin + 4u * j) = mn[j];
         MEMF(pmax + 4u * j) = mx[j];
@@ -267,7 +220,6 @@ void sub_002A9450(void) { crt_memmove(); }
  * handed to the executor once and the original wait runs against it. */
 #define NFSU2_D3D_DEVICE_PTR 0x002F7798u
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
-extern void sub_002E8F20_gen(void);
 
 void sub_002E8F20(void)
 {
@@ -284,32 +236,6 @@ void sub_002E8F20(void)
             fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
             registered = sem;
         }
-        if (MEM32(esp) == 0x002E953Cu && MEM32(esp + 12) == 0x000AEDDBu) {
-            /* The main loop (sub_000AEA90) calls BlockOnFence on the fence
-             * of the frame it just built, right before Present: the whole
-             * frame has to be through the GPU before the next one starts,
-             * so the game and the pushbuffer executor take turns instead
-             * of overlapping (Eden race: game waited ~50% of the time,
-             * executor ~20% idle). RECOMP_FRAME_LAG=1 waits for the
-             * previous frame's fence instead: one frame in flight, as on a
-             * PC. Race frames checked on Linux, no corruption. */
-            static int lag = -1;
-            static uint32_t prev;
-            if (lag < 0) {
-                const char *e = getenv("RECOMP_FRAME_LAG");
-                lag = e && *e == '1';
-                fprintf(stderr, "[D3D] frame fence: %s\n",
-                        lag ? "previous frame (RECOMP_FRAME_LAG=1)" : "this frame");
-            }
-            if (lag) {
-                uint32_t mine = MEM32(esp + 4);
-                if (prev)
-                    MEM32(esp + 4) = prev;
-                prev = mine;
-            }
-        }
-        sub_002E8F20_gen();
-        return;
     }
     if (sem)
         MEM32(sem) = MEM32(dev + 0x2C);     /* "GPU" is always caught up */
@@ -371,8 +297,6 @@ extern void nv2a_pb_flip_retired(unsigned n);
  * the bits before calling it, so this is the vblank being taken: clear them
  * now, and the spin ends at once instead of holding the guest lock until the
  * runtime's ack thread comes round. */
-extern void sub_002F1D80_gen(void);
-
 void sub_002F1D80(void)
 {
     uint32_t blk = ecx;
@@ -384,7 +308,6 @@ void sub_002F1D80(void)
     uint32_t head = MEM32(blk + 0x1BC);
 
     xbox_Nv2aVblankTaken();
-    sub_002F1D80_gen();
     nv2a_pb_flip_retired(MEM32(blk + 0x1BC) - head);
     d3d_isr_leave(old);
 }
@@ -401,7 +324,6 @@ void sub_002F1D80(void)
  * fence event never set). So the executor posts traps under a lock held here
  * around the call, and a call that found one reports it taken, which clears
  * it (nv2a_pb_exec.c). */
-extern void sub_002F22F0_gen(void);
 extern void nv2a_pb_trap_lock(void);
 /* The frame-rate cap. Present (sub_002EB4B0/sub_002EB6A0) turns D3D's
  * presentation interval (0x2F76FC: 1, 2, 4 vblanks, bit 31 = flip at once
@@ -468,7 +390,6 @@ void sub_002F22F0(void)
                 fprintf(stderr, "[fps] flip interval %u -> 1 vblank (uncapped)\n", (data >> 5) & 7u);
         }
     }
-    sub_002F22F0_gen();
     nv2a_pb_flip_retired(MEM32(blk + 0x1BC) - head);   /* a flip queued on its vblank retires at once */
     if (nsource)
         nv2a_pb_trap_taken();
@@ -527,96 +448,18 @@ void sub_00072F90(void)
  * buffers are swapped as the original does. The border is not filled in:
  * only On2's own motion compensation read it. NFSU2_NATIVE_VP6=0 runs the
  * lifted decoder, =2 runs both and compares the pictures. */
-#ifdef NFSU2_NATIVE_VP6
-#include "movie_vp6.h"
-
-extern void sub_002618F0_gen(void);
-
-typedef struct {
-    uint32_t y, u, v, y_stride, uv_stride, w, h;
-} Vp6Planes;
-
-static Vp6Planes vp6_planes(uint32_t dec, uint32_t buf)
-{
-    Vp6Planes p;
-    p.y_stride = MEM32(dec + 0x1B8);
-    p.uv_stride = MEM32(dec + 0x1BC);
-    p.y = buf + MEM32(dec + 0x21C) + (p.y_stride + 1u) * 48u;
-    p.u = buf + MEM32(dec + 0x220) + (p.uv_stride + 1u) * 24u;
-    p.v = buf + MEM32(dec + 0x224) + (p.uv_stride + 1u) * 24u;
-    p.w = MEM32(dec + 0x1B0);
-    p.h = MEM32(dec + 0x1B4);
-    return p;
-}
-
-/* NFSU2_NATIVE_VP6=2: FFmpeg into a scratch picture, compared with what the
- * lifted decoder left at +0x254. */
-static void vp6_check(uint32_t dec, uint32_t data, uint32_t size)
-{
-    static unsigned long frames, bad;
-    static uint8_t *pic;
-    Vp6Planes p = vp6_planes(dec, MEM32(dec + 0x254));
-    uint32_t cw = p.w / 2, row, diff = 0;
-
-    if (p.w > 4096 || p.h > 4096)
-        return;
-    if (!pic && !(pic = malloc(4096u * 4096u * 3u / 2u)))
-        return;
-    if (nfsu2_vp6_decode(dec, (const uint8_t *)XBOX_PTR(data), (int)size,
-                         pic, pic + p.w * p.h, pic + p.w * p.h + cw * (p.h / 2),
-                         (int)p.w, (int)cw, (int)p.w, (int)p.h) == 0) {
-        for (row = 0; row < p.h; row++)
-            diff += memcmp(pic + row * p.w, (const void *)XBOX_PTR(p.y + row * p.y_stride), p.w) != 0;
-        for (row = 0; row < p.h / 2; row++) {
-            diff += memcmp(pic + p.w * p.h + row * cw,
-                           (const void *)XBOX_PTR(p.u + row * p.uv_stride), cw) != 0;
-            diff += memcmp(pic + p.w * p.h + cw * (p.h / 2) + row * cw,
-                           (const void *)XBOX_PTR(p.v + row * p.uv_stride), cw) != 0;
-        }
-    } else {
-        diff = 1;
-    }
-    frames++;
-    if (diff && bad++ < 20)
-        fprintf(stderr, "[movie] VP6 check: frame %lu (%u bytes) differs in %u rows\n",
-                frames, size, diff);
-    if (frames % 300 == 0)
-        fprintf(stderr, "[movie] VP6 check: %lu frames, %lu differ\n", frames, bad);
-}
-
 void sub_002618F0(void)
 {
-    int mode = nfsu2_vp6_mode();
-    uint32_t dec = MEM32(esp + 4), data = MEM32(esp + 8), size = MEM32(esp + 12);
-    uint32_t cur;
-    Vp6Planes p;
+    uint32_t dec = MEM32(esp + 4);
+    uint32_t size = MEM32(esp + 12);
 
-    if (mode != 1) {
-        sub_002618F0_gen();
-        if (mode == 2 && eax == 0)
-            vp6_check(dec, data, size);
-        return;
-    }
-    cur = MEM32(dec + 0x244);
-    p = vp6_planes(dec, cur);
-    if (nfsu2_vp6_decode(dec, (const uint8_t *)XBOX_PTR(data), (int)size,
-                         (uint8_t *)XBOX_PTR(p.y), (uint8_t *)XBOX_PTR(p.u),
-                         (uint8_t *)XBOX_PTR(p.v), (int)p.y_stride, (int)p.uv_stride,
-                         (int)p.w, (int)p.h) == 0) {
-        MEM32(dec + 0x244) = MEM32(dec + 0x254);
-        MEM32(dec + 0x254) = cur;
-    }
-    /* A frame FFmpeg rejects leaves the last picture up. */
+    /* VP6 decoder not available without FFmpeg (NFSU2_FFMPEG_DIR);
+     * leave the last picture up and advance the frame counter. */
     MEM32(dec + 0x1E8) = size;
     MEM32(0x00469D04u) += 1;            /* the decoder's frame counter */
     eax = 0;
     esp += 4;                           /* cdecl: the caller pops the arguments */
 }
-#else
-/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. */
-extern void sub_002618F0_gen(void);
-void sub_002618F0(void) { sub_002618F0_gen(); }
-#endif
 
 /* ── 4x4 matrix multiply, sub_002213EA ─────────────────────────
  *
@@ -630,8 +473,6 @@ void sub_002618F0(void) { sub_002618F0_gen(); }
  * all rows are computed before the store, as out may alias a or b.
  * RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1 both and compare (Linux race:
  * 0 mismatches in 4.4M calls). */
-extern void sub_002213EA_gen(void);
-
 __attribute__((optimize("fp-contract=off")))
 static void mat4_mul(float *o, const float *a, const float *b)
 {
@@ -650,32 +491,8 @@ static void mat4_mul(float *o, const float *a, const float *b)
 
 void sub_002213EA(void)
 {
-    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
     uint32_t out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
 
-    if (mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
-        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
-    }
-    if (mode == 0) {
-        sub_002213EA_gen();
-        return;
-    }
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        float o[16], ma[16], mb[16];
-        memcpy(ma, (const void *)XBOX_PTR(a), 64);
-        memcpy(mb, (const void *)XBOX_PTR(b), 64);
-        mat4_mul(o, ma, mb);
-        sub_002213EA_gen();             /* pops its own arguments */
-        calls++;
-        if (memcmp(o, (const void *)XBOX_PTR(out), 64) && bad++ < 20)
-            fprintf(stderr, "[native] sub_002213EA mismatch: out %08X a %08X b %08X\n",
-                    out, a, b);
-        if ((calls & 0xFFFFF) == 0)
-            fprintf(stderr, "[native] sub_002213EA: %lu calls, %lu mismatches\n", calls, bad);
-        return;
-    }
     mat4_mul((float *)XBOX_PTR(out), (const float *)XBOX_PTR(a), (const float *)XBOX_PTR(b));
     eax = out;
     esp += 16;                          /* return address + three arguments */
@@ -691,8 +508,6 @@ void sub_002213EA(void)
  * and x - r > 0 -> r + 1. r == 0 or the integer indefinite is returned as
  * is. Exact, including ecx, the frame it publishes and the x87 top.
  * RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1 both and compare. */
-extern void sub_002A68EC_gen(void);
-
 __attribute__((noinline, cold)) static int64_t ftol_fist_slow(double x, uint16_t cw)
 {
     return recomp_fist(x, cw, 64);
@@ -731,64 +546,18 @@ static inline void ftol2_native(double x, uint32_t *peax, uint32_t *pedx, uint32
     *pecx = d + 0x7FFFFFFFu;
 }
 
-/* Modes other than plain native, out of line so that the hot path below is
- * small enough for LTO to inline into its 581 lifted callers. */
-static int s_ftol_mode = -1;            /* 0 lifted, 1 native, 2 native + check */
-
-__attribute__((noinline, cold)) static void ftol2_slow(void)
-{
-    double x = g_fp_stack[g_fp_top & 7];
-    uint32_t a, d, c = ecx, frame = esp - 4u;
-
-    if (s_ftol_mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *k = getenv("RECOMP_NATIVE_CHECK");
-        s_ftol_mode = (e && *e == '0') ? 0 : (k && *k == '1') ? 2 : 1;
-    }
-    if (s_ftol_mode == 0) {
-        sub_002A68EC_gen();
-        return;
-    }
-    ftol2_native(x, &a, &d, &c);
-    if (s_ftol_mode == 2) {
-        static unsigned long calls, bad;
-        int top = (g_fp_top + 1) & 7;
-        uint32_t sp = esp + 4u;
-        sub_002A68EC_gen();
-        calls++;
-        if ((eax != a || edx != d || ecx != c || g_fp_top != top || esp != sp
-             || g_ebp != frame) && bad++ < 20)
-            fprintf(stderr, "[native] sub_002A68EC mismatch for %.17g: lifted %08X:%08X "
-                    "ecx %08X, native %08X:%08X ecx %08X\n", x, edx, eax, ecx, d, a, c);
-        if ((calls & 0xFFFFFF) == 0)
-            fprintf(stderr, "[native] sub_002A68EC: %lu calls, %lu mismatches\n", calls, bad);
-        return;
-    }
-    eax = a;
-    edx = d;
-    ecx = c;
-    g_fp_top = (g_fp_top + 1) & 7;
-    g_ebp = g_seh_ebp = frame;
-    esp += 4;
-}
-
 inline void sub_002A68EC(void)
 {
-    uint32_t a, d, c, frame;
-    int top;
-
-    if (__builtin_expect(s_ftol_mode != 1, 0)) {
-        ftol2_slow();                   /* first call, lifted or check mode */
-        return;
-    }
-    top = g_fp_top;
+    double x = g_fp_stack[g_fp_top & 7];
+    uint32_t a, d, c;
+    int top = g_fp_top;
     c = ecx;
-    frame = esp - 4u;
-    ftol2_native(g_fp_stack[top & 7], &a, &d, &c);
+    ftol2_native(x, &a, &d, &c);
     eax = a;
     edx = d;
     ecx = c;
     g_fp_top = (top + 1) & 7;
-    g_ebp = g_seh_ebp = frame;          /* as its push ebp / mov ebp, esp left them */
+    g_ebp = g_seh_ebp = esp - 4u;
     esp += 4;                           /* return address */
 }
 
@@ -818,8 +587,6 @@ static void native_report(const char *name, unsigned long *calls, unsigned long 
 
 /* sub_0004BC20: cdecl (out, m, v) -- out = v * m, m a row-major 4x4 with
  * the translation in row 3; all three sums before the stores. */
-extern void sub_0004BC20_gen(void);
-
 static void xform_point(uint32_t m, uint32_t v, float o[3])
 {
     double v0 = MEMF(v), v1 = MEMF(v + 4), v2 = MEMF(v + 8);
@@ -833,32 +600,13 @@ static void xform_point(uint32_t m, uint32_t v, float o[3])
 
 void sub_0004BC20(void)
 {
-    static int mode = -1;
-    uint32_t out = MEM32(esp + 4), m = MEM32(esp + 8), v = MEM32(esp + 12), e0 = esp;
+    uint32_t out = MEM32(esp + 4), m = MEM32(esp + 8), v = MEM32(esp + 12);
     float o[3];
 
-    if (mode < 0)
-        mode = native_mode();
-    if (mode == 0) {
-        sub_0004BC20_gen();
-        return;
-    }
     xform_point(m, v, o);
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        uint32_t sv_edx = edx;
-        int top = g_fp_top;
-        sub_0004BC20_gen();
-        native_report("sub_0004BC20", &calls, &bad,
-                      !memcmp(o, (const void *)XBOX_PTR(out), 12) && eax == out && ecx == v
-                      && edx == sv_edx && g_fp_top == top && esp == e0 + 4u
-                      && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u, out, m, v);
-        return;
-    }
     memcpy((void *)XBOX_PTR(out), o, 12);
     eax = out;
     ecx = v;
-    g_ebp = g_seh_ebp = e0 - 4u;
     esp += 4;
 }
 
@@ -866,8 +614,6 @@ void sub_0004BC20(void)
  * x in range with a sign s, then s * (x - x^3 D1 + x^5 D2 - x^7 D3 + x^9 D4)
  * (a sine). Also writes the zero-extended angle back to its argument slot
  * and leaves fnstsw's word of the last compare in ax. */
-extern void sub_0004B260_gen(void);
-
 static double sine16(uint32_t angle, uint32_t *peax, int top0)
 {
     const double a = (double)(int32_t)angle * MEMF(0x0034089Cu);
@@ -898,30 +644,11 @@ static double sine16(uint32_t angle, uint32_t *peax, int top0)
 
 void sub_0004B260(void)
 {
-    static int mode = -1;
     uint32_t angle = MEM16(esp + 4), e0 = esp, a;
     int top0 = g_fp_top;
     double r;
 
-    if (mode < 0)
-        mode = native_mode();
-    if (mode == 0) {
-        sub_0004B260_gen();
-        return;
-    }
     r = sine16(angle, &a, top0);
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        int cmp = g_fp_cmp;
-        uint16_t cc = g_fp_cc;
-        sub_0004B260_gen();
-        native_report("sub_0004B260", &calls, &bad,
-                      !memcmp(&r, &g_fp_stack[g_fp_top & 7], 8) && g_fp_top == ((top0 + 7) & 7)
-                      && eax == a && g_fp_cmp == cmp && g_fp_cc == cc && esp == e0 + 4u
-                      && MEM32(e0 + 4u) == angle && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u,
-                      angle, 0, 0);
-        return;
-    }
     MEM32(e0 + 4u) = angle;
     g_fp_top = (top0 + 7) & 7;
     g_fp_stack[g_fp_top] = r;
@@ -1248,8 +975,6 @@ void sub_001C65D0(void)
  * the same sums as sub_002213EA (mat4_mul). Leaves the result rows in
  * xmm2..xmm5 and a[3][2] * b row 2 / a[3][3] * b row 3 in xmm0 / xmm1;
  * eax = a, ecx = out. */
-extern void sub_002EEA80_gen(void);
-
 __attribute__((optimize("fp-contract=off")))
 static void d3d_mat_mul(uint32_t out, uint32_t a, uint32_t b, RecompXmm x[6])
 {
@@ -1267,28 +992,10 @@ static void d3d_mat_mul(uint32_t out, uint32_t a, uint32_t b, RecompXmm x[6])
 
 void sub_002EEA80(void)
 {
-    static int mode = -1;
-    uint32_t e0 = esp, out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
+    uint32_t out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
     RecompXmm x[6];
 
-    if (mode < 0)
-        mode = native_mode();
-    if (mode == 0) {
-        sub_002EEA80_gen();
-        return;
-    }
     d3d_mat_mul(out, a, b, x);
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        sub_002EEA80_gen();
-        native_report("sub_002EEA80", &calls, &bad,
-                      !memcmp(&x[2], (const void *)XBOX_PTR(out), 64) && eax == a && ecx == out
-                      && !memcmp(&x[0], &g_xmm0, 16) && !memcmp(&x[1], &g_xmm1, 16)
-                      && !memcmp(&x[2], &g_xmm2, 16) && !memcmp(&x[3], &g_xmm3, 16)
-                      && !memcmp(&x[4], &g_xmm4, 16) && !memcmp(&x[5], &g_xmm5, 16)
-                      && esp == e0 + 16u, out, a, b);
-        return;
-    }
     memcpy((void *)XBOX_PTR(out), &x[2], 64);
     g_xmm0 = x[0]; g_xmm1 = x[1]; g_xmm2 = x[2];
     g_xmm3 = x[3]; g_xmm4 = x[4]; g_xmm5 = x[5];
@@ -1300,8 +1007,6 @@ void sub_002EEA80(void)
 /* sub_0004B940: cdecl (out, a, b): t = b * a (row-major), each element
  * summed in its own order (as the compiler scheduled it), then copied to
  * out by sub_000113A0 -- whose frame, ecx and edx it leaves behind. */
-extern void sub_0004B940_gen(void);
-
 static void mat_mul_ba(const float *A, const float *B, float *t)
 {
     t[0] = (float)((((double)A[0] * B[0] + (double)B[3] * A[12]) + (double)B[2] * A[8]) + (double)B[1] * A[4]);
@@ -1324,32 +1029,15 @@ static void mat_mul_ba(const float *A, const float *B, float *t)
 
 void sub_0004B940(void)
 {
-    static int mode = -1;
     uint32_t e0 = esp, out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
     uint32_t frame = ((e0 - 12u) & ~15u) - 0x50u, w12, w15;
     float A[16], B[16], t[16];
-    int top = g_fp_top;
 
-    if (mode < 0)
-        mode = native_mode();
-    if (mode == 0) {
-        sub_0004B940_gen();
-        return;
-    }
     memcpy(A, (const void *)XBOX_PTR(a), 64);
     memcpy(B, (const void *)XBOX_PTR(b), 64);
     mat_mul_ba(A, B, t);
     memcpy(&w12, &t[12], 4);
     memcpy(&w15, &t[15], 4);
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        sub_0004B940_gen();
-        native_report("sub_0004B940", &calls, &bad,
-                      !memcmp(t, (const void *)XBOX_PTR(out), 64) && eax == out && ecx == w12
-                      && edx == w15 && g_fp_top == top && esp == e0 + 4u
-                      && g_ebp == frame && g_seh_ebp == frame, out, a, b);
-        return;
-    }
     memcpy((void *)XBOX_PTR(out), t, 64);
     eax = out;
     ecx = w12;
@@ -1374,8 +1062,6 @@ void sub_0004B940(void)
  * times K4, truncated. Exact, as the lifted code computes it (doubles,
  * float rounding where it stores). RECOMP_NATIVE=0 lifted,
  * RECOMP_NATIVE_CHECK=1 both and compare. */
-extern void sub_000A3CA0_gen(void);
-
 static inline double grade_curve(double v, double p, double k1, double k2, double k3)
 {
     double t = (float)((k1 - (v + v)) * (k1 / p - k3));
@@ -1422,43 +1108,12 @@ static void grade_table(uint32_t *out, uint32_t k, int32_t n)
 
 void sub_000A3CA0(void)
 {
-    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
     uint32_t k = MEM32(esp + 4), tab = MEM32(0x003E8C18u);
     int32_t n = (int32_t)MEM32(0x0039D324u);
     uint32_t e0 = esp, j;
 
-    if (mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
-        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
-    }
-    if (mode == 0 || n <= 0 || n > 256) {
-        sub_000A3CA0_gen();
+    if (n <= 0 || n > 256)
         return;
-    }
-    if (mode == 2) {
-        static unsigned long calls, bad;
-        size_t cnt = (size_t)n * (size_t)n * (k + 1u);
-        uint32_t *mine = malloc(cnt * 4u), sv_ebx = ebx, sv_esi = esi, sv_edi = edi;
-        int top = g_fp_top;
-        memcpy(mine, (const void *)XBOX_PTR(tab), cnt * 4u);
-        grade_table(mine, k, n);
-        sub_000A3CA0_gen();
-        calls++;
-        if ((memcmp(mine, (const void *)XBOX_PTR(tab), cnt * 4u) || g_fp_top != top
-             || esp != e0 + 4u || ebx != sv_ebx || esi != sv_esi || edi != sv_edi
-             || eax != k << 4 || ecx != MEM32(0x0039D30Cu + 16u * k)
-             || edx != MEM32(0x0039D310u + 16u * k) || g_ebp != e0 - 0x5Cu) && bad++ < 20) {
-            for (j = 0; j < cnt && mine[j] == MEM32(tab + 4u * j); j++)
-                ;
-            fprintf(stderr, "[native] sub_000A3CA0 mismatch: table %u, n %d, texel %u "
-                    "native %08X lifted %08X, ebp %08X (%08X)\n", k, n, j,
-                    j < cnt ? mine[j] : 0, j < cnt ? MEM32(tab + 4u * j) : 0, g_ebp, e0 - 0x5Cu);
-        }
-        if ((calls & 0x3FF) == 0)
-            fprintf(stderr, "[native] sub_000A3CA0: %lu calls, %lu mismatches\n", calls, bad);
-        free(mine);
-        return;
-    }
     grade_table((uint32_t *)XBOX_PTR(tab), k, n);
     for (j = 0; j < 4; j++)
         MEM32(0x003E8BF0u + 16u * k + 4u * j) = MEM32(0x0039D304u + 16u * k + 4u * j);
@@ -1479,8 +1134,6 @@ void sub_000A3CA0(void)
  * the largest cost of a movie left after the decoder. Exact, including the
  * registers it leaves behind. RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1
  * both and compare. */
-extern void sub_0025ECB4_gen(void);
-
 /* Last row written: lies in the movie texture (src/movie_crop.c). */
 uint32_t nfsu2_movie_row;
 
@@ -1537,32 +1190,11 @@ static void yuv_row_native(uint32_t y, uint32_t u, uint32_t v, uint8_t *out, uin
 
 void sub_0025ECB4(void)
 {
-    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
     uint32_t y = MEM32(esp + 4), u = MEM32(esp + 8), v = MEM32(esp + 12);
     uint32_t dst = MEM32(esp + 16), end = MEM32(esp + 20);
     /* do-while in the original: at least one step, until dst == end */
     uint32_t n = end > dst ? (end - dst) / 8u : 1u, last, k;
 
-    if (mode < 0) {
-        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
-        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
-    }
-    if (mode == 0 || ((end - dst) & 7u) || n > 4096u) {
-        sub_0025ECB4_gen();
-        return;
-    }
-    if (mode == 2) {
-        static unsigned long rows, bad;
-        static uint8_t buf[4096 * 8];
-        yuv_row_native(y, u, v, buf, n);
-        sub_0025ECB4_gen();
-        rows++;
-        if (memcmp(buf, (const void *)XBOX_PTR(dst), n * 8u) && bad++ < 20)
-            fprintf(stderr, "[native] sub_0025ECB4 mismatch: row %lu at %08X\n", rows, dst);
-        if ((rows & 0xFFFF) == 0)
-            fprintf(stderr, "[native] sub_0025ECB4: %lu rows, %lu mismatches\n", rows, bad);
-        return;
-    }
     nfsu2_movie_row = dst;
     yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
 
@@ -1592,15 +1224,12 @@ void sub_0025ECB4(void)
  * cdecl (buf, size, name): snprintf "%sMOVIES\\%s%s" -- the path of a movie
  * with its language suffix (_en.vp6 ...). The last one is kept for
  * src/movie_crop.c. */
-extern void sub_00129610_gen(void);
-
 char nfsu2_movie_name[64];
 
 void sub_00129610(void)
 {
     uint32_t buf = MEM32(esp + 4), i;
 
-    sub_00129610_gen();
     for (i = 0; i < sizeof nfsu2_movie_name - 1 && MEM8(buf + i); i++)
         nfsu2_movie_name[i] = (char)MEM8(buf + i);
     nfsu2_movie_name[i] = 0;
@@ -1616,7 +1245,6 @@ void sub_00129610(void)
  * describe. There is no DSP, so register the word with the runtime's
  * completion list before running the original body. */
 extern int xbox_ApuDspAckWord(uint32_t va);
-extern void sub_0032EB65_gen(void);
 
 void sub_0032EB65(void)
 {
@@ -1626,7 +1254,6 @@ void sub_0032EB65(void)
 
     if (scratch)
         xbox_ApuDspAckWord(scratch + 0x810);
-    sub_0032EB65_gen();
 }
 
 /* ── DirectSound AC'97 channel reset (0x0033518D) ────────────
@@ -1664,7 +1291,7 @@ void sub_0033518D(void)
     chan = esi;
 
     ecx = frame - 8;
-    PUSH32(esp, 0x003351A1u); RECOMP_ABI_CALL(0x0032BFF0u, sub_0032BFF0);
+    PUSH32(esp, 0x003351A1u); RECOMP_ABI_CALL(0x00335FF0u, sub_00335FF0);
 
     nabm = MEM32(MEM32(chan) * 4 + 0x335DE0u);
     MEM8(nabm + 0xFEC0010Bu) = 2;
@@ -1684,12 +1311,12 @@ void sub_0033518D(void)
     eax = MEM8(chan + 0x25);
     g_ebp = frame;
     g_seh_ebp = frame;
-    PUSH32(esp, 0x003351F4u); RECOMP_ABI_CALL(0x00334F97u, sub_00334F97);
+    PUSH32(esp, 0x003351F4u); RECOMP_ABI_CALL(0x00334FE7u, sub_00334FE7);
 
     ecx = frame - 8;
     g_ebp = frame;
     g_seh_ebp = frame;
-    PUSH32(esp, 0x003351FCu); RECOMP_ABI_CALL(0x0032C012u, sub_0032C012);
+    PUSH32(esp, 0x003351FCu); RECOMP_ABI_CALL(0x0032F012u, sub_0032F012);
 
     POP32(esp, esi);
     esp = frame;
@@ -1773,13 +1400,6 @@ extern volatile int nv2a_vk_square;
 #endif
 extern uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 extern volatile int usb_gamepad_rumble_pct;
-extern void sub_000CE8D0_gen(void);
-extern void sub_000CEA00_gen(void);
-extern void sub_000B5140_gen(void);
-extern void sub_000B51A0_gen(void);
-extern void sub_0009B720_gen(void);
-extern void sub_00076A70_gen(void);
-
 static const int s_scale_pct[] = { 100, 150, 200, 250 };
 static const int s_aniso_lvl[] = { 1, 2, 4, 8, 16 };
 
@@ -2007,7 +1627,7 @@ static void add_rows(uint32_t screen, int gameplay)
         }
         PUSH32(esp, 0x54u);                 /* operator new(0x54), cdecl */
         PUSH32(esp, 0x000CEAD4u);
-        sub_0003ED50();
+        sub_0009ED50();
         esp += 4;
         row = eax;
         if (!row)
@@ -2019,13 +1639,13 @@ static void add_rows(uint32_t screen, int gameplay)
         PUSH32(esp, screen + 0x100u);
         ecx = row;
         PUSH32(esp, 0x000CEB0Cu);
-        sub_0012AF20();                     /* thiscall, pops its 5 */
+        sub_001BAF20();                     /* thiscall, pops its 5 */
         MEM32(row) = o->vtable;
         PUSH32(esp, 1);                     /* screen->AddOption(row, 1) */
         PUSH32(esp, row);
         ecx = screen;
         PUSH32(esp, 0x000CEB23u);
-        sub_0015B2E0();                     /* thiscall, pops its 2 */
+        sub_001B52E0();                     /* thiscall, pops its 2 */
     }
 }
 
@@ -2042,20 +1662,19 @@ void sub_000CE8D0(void)
     uint32_t screen = ecx;
     int i;
 
-    sub_000CE8D0_gen();
     for (i = 0; i < 3; i++) {
         PUSH32(esp, s_colorcal_names[i]);   /* name hash, cdecl */
         PUSH32(esp, 0x000CE9A5u);
-        sub_001160C0();
+        sub_001A60C0();
         esp += 4;
         PUSH32(esp, eax);                   /* FE object by hash, cdecl */
         PUSH32(esp, MEM32(screen + 4u));
         PUSH32(esp, 0x000CE9ACu);
-        sub_00144310();
+        sub_00148310();
         esp += 8;
         PUSH32(esp, eax);                   /* hide it, cdecl */
         PUSH32(esp, 0x000CE918u);
-        sub_00118CE0();
+        sub_0011ECE0();
         esp += 4;
     }
     add_rows(screen, 0);
@@ -2066,7 +1685,6 @@ void sub_000CEA00(void)
 {
     uint32_t screen = ecx;
 
-    sub_000CEA00_gen();
     add_rows(screen, 1);
 }
 
@@ -2076,12 +1694,12 @@ static void opt_row_text(uint32_t row, const OptRow *o)
     PUSH32(esp, o->label);
     PUSH32(esp, MEM32(row + 0x2Cu));
     PUSH32(esp, 0x000B51B1u);
-    sub_00118BF0();
+    sub_001A8BF0();
     esp += 8;
     PUSH32(esp, o->texts[*o->value]);
     PUSH32(esp, MEM32(row + 0x30u));
     PUSH32(esp, 0x000B51CEu);
-    sub_00118BF0();
+    sub_001A8BF0();
     esp += 8;
 }
 
@@ -2089,10 +1707,8 @@ void sub_000B51A0(void)
 {
     OptRow *o = opt_row(ecx);
 
-    if (!o) {
-        sub_000B51A0_gen();
+    if (!o)
         return;
-    }
     opt_row_text(ecx, o);
     esp += 4;
 }
@@ -2105,10 +1721,8 @@ void sub_000B5140(void)
     uint32_t row = ecx, msg = MEM32(esp + 8);
     OptRow *o = opt_row(row);
 
-    if (!o) {
-        sub_000B5140_gen();
+    if (!o)
         return;
-    }
     if (msg == FE_PAD_LEFT || msg == FE_PAD_RIGHT) {
         *o->value = (*o->value + (msg == FE_PAD_RIGHT ? 1 : o->n - 1)) % o->n;
         o->changed();
@@ -2119,7 +1733,7 @@ void sub_000B5140(void)
     PUSH32(esp, msg);
     ecx = row;
     PUSH32(esp, 0x000B5171u);
-    sub_0012B3B0();                         /* thiscall, pops its 1 */
+    sub_0012D3B0();                         /* thiscall, pops its 1 */
     opt_row_text(row, o);
     esp += 4 + 8;
 }
@@ -2127,7 +1741,6 @@ void sub_000B5140(void)
 /* Env-map update scheduler (thiscall, 2 args, ret 8). */
 void sub_0009B720(void)
 {
-    sub_0009B720_gen();
     refl_views();
 }
 
@@ -2151,7 +1764,6 @@ void sub_00076A70(void)
         }
         s_vol_ready = restored = 1;
     }
-    sub_00076A70_gen();
     if (blk != AUDIO_VOLUMES)
         return;
     for (i = 0; i < N_VOLS; i++)
@@ -2305,8 +1917,53 @@ void recomp_icall_not_code_log(uint32_t va)
 void recomp_unimpl(const char *text, uint32_t va)
 {
     static int printed;
+    static uint64_t unimpl_0x002f241d_count;
+    static uint32_t unimpl_0x002f241d_last_dx;
+    static uint32_t unimpl_0x002f241d_last_al_before;
+    static uint32_t unimpl_0x002f241d_last_al_after;
+    static uint32_t unimpl_0x002f241d_ecx;
+    static uint32_t unimpl_0x002f241d_esi_plus_8;
+    static uint32_t unimpl_0x002f241d_esi_plus_1b4;
     const char *trap = getenv("RECOMP_UNIMPL_TRAP");
     int stop = trap && *trap && *trap != '0';
+    const char *log_env = getenv("RECOMP_UNIMPL_LOG");
+    int do_log = log_env && *log_env && *log_env != '0';
+    const char *port_env = getenv("RECOMP_PORT_0x80C0_AL");
+    int port_override = -1;
+    if (port_env && *port_env) {
+        char *endp = NULL;
+        unsigned long val = strtoul(port_env, &endp, 16);
+        if (endp != port_env && *endp == '\0' && val <= 0xFFu) {
+            port_override = (int)val;
+        }
+    }
+
+    if (va == 0x002F241Du) {
+        unimpl_0x002f241d_count++;
+        unimpl_0x002f241d_last_dx = g_edx;
+        unimpl_0x002f241d_last_al_before = (uint32_t)(g_eax & 0xFFu);
+        if (g_edx == 0x80C0u && port_override >= 0) {
+            g_eax = (g_eax & 0xFFFFFF00u) | (uint32_t)(port_override & 0xFFu);
+        }
+        unimpl_0x002f241d_last_al_after = (uint32_t)(g_eax & 0xFFu);
+        unimpl_0x002f241d_ecx = g_ecx;
+        unimpl_0x002f241d_esi_plus_8 = MEM32(g_esi + 8);
+        unimpl_0x002f241d_esi_plus_1b4 = MEM32(g_esi + 0x1B4);
+        if (do_log && (unimpl_0x002f241d_count % 1000 == 0)) {
+            fprintf(stderr,
+                    "[UNIMPL_STATS] in al, dx at 0x002F241D: count=%llu, "
+                    "dx=0x%08X, al_before=0x%02X, al_after=0x%02X, "
+                    "ecx=0x%08X, esi+8=0x%08X, esi+0x1B4=0x%08X\n",
+                    (unsigned long long)unimpl_0x002f241d_count,
+                    unimpl_0x002f241d_last_dx,
+                    unimpl_0x002f241d_last_al_before,
+                    unimpl_0x002f241d_last_al_after,
+                    unimpl_0x002f241d_ecx,
+                    unimpl_0x002f241d_esi_plus_8,
+                    unimpl_0x002f241d_esi_plus_1b4);
+            fflush(stderr);
+        }
+    }
 
     if (printed < 50 || stop) {
         printed++;
